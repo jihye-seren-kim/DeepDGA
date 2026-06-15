@@ -5,91 +5,112 @@ from __future__ import print_function
 import os
 import time
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 
-import model
-from data_reader import load_data, DataReader
-
+import dga_model
+from dga_reader import load_data, DataReader
 
 flags = tf.flags
 
-# data
-flags.DEFINE_string('data_dir',    'data',   'data directory. Should contain train.txt/valid.txt/test.txt with input data')
-flags.DEFINE_string('train_dir',   'cv',     'training directory (models and summaries are saved there periodically)')
-flags.DEFINE_string('load_model',   None,    '(optional) filename of the model to load. Useful for re-starting training from a checkpoint')
+flags.DEFINE_string('data_dir', 'dga_data', 'data directory')
+flags.DEFINE_string('load_model', None, 'checkpoint path without .meta/.index')
 
-# model params
-flags.DEFINE_integer('rnn_size',        650,                            'size of LSTM internal state')
-flags.DEFINE_integer('highway_layers',  2,                              'number of highway layers')
-flags.DEFINE_integer('char_embed_size', 15,                             'dimensionality of character embeddings')
-flags.DEFINE_string ('kernels',         '[1,2,3,4,5,6,7]',              'CNN kernel widths')
-flags.DEFINE_string ('kernel_features', '[50,100,150,200,200,200,200]', 'number of features in the CNN kernel')
-flags.DEFINE_integer('rnn_layers',      2,                              'number of layers in the LSTM')
-flags.DEFINE_float  ('dropout',         0.5,                            'dropout. 0 = no dropout')
-
-# optimization
-flags.DEFINE_integer('num_unroll_steps',    35,   'number of timesteps to unroll for')
-flags.DEFINE_integer('batch_size',          20,   'number of sequences to train on in parallel')
-flags.DEFINE_integer('max_word_length',     65,   'maximum word length')
-
-# bookkeeping
-flags.DEFINE_integer('seed',           3435, 'random number generator seed')
-flags.DEFINE_string ('EOS',            '+',  '<EOS> symbol. should be a single unused character (like +) for PTB and blank for others')
+flags.DEFINE_integer('rnn_size', 50, 'size of LSTM internal state')
+flags.DEFINE_integer('highway_layers', 2, 'number of highway layers')
+flags.DEFINE_integer('char_embed_size', 30, 'character embedding size')
+flags.DEFINE_integer('embed_dimension', 32, 'embedding dimension')
+flags.DEFINE_string('kernels', str([2] * 20 + [3] * 10), 'CNN kernel widths')
+flags.DEFINE_string('kernel_features', str([32] * 30), 'CNN kernel features')
+flags.DEFINE_integer('rnn_layers', 2, 'number of LSTM layers')
+flags.DEFINE_float('dropout', 0.0, 'dropout during evaluation')
+flags.DEFINE_integer('batch_size', 64, 'batch size')
+flags.DEFINE_integer('max_word_length', 70, 'maximum word length')
+flags.DEFINE_integer('seed', 1021, 'random seed')
 
 FLAGS = flags.FLAGS
 
 
-def run_test(session, m, data, batch_size, num_steps):
-    """Runs the model on the given data."""
+def build_partial_saver(checkpoint_path):
+    reader = tf.train.NewCheckpointReader(checkpoint_path)
+    ckpt_vars = reader.get_variable_to_shape_map()
 
-    costs = 0.0
-    iters = 0
-    state = session.run(m.initial_state)
+    restore_vars = []
+    skipped_vars = []
 
-    for step, (x, y) in enumerate(reader.dataset_iterator(data, batch_size, num_steps)):
-        cost, state = session.run([m.cost, m.final_state], {
-            m.input_data: x,
-            m.targets: y,
-            m.initial_state: state
-        })
+    for v in tf.global_variables():
+        name = v.name.split(":")[0]
+        if name in ckpt_vars:
+            restore_vars.append(v)
+        else:
+            skipped_vars.append(name)
 
-        costs += cost
-        iters += 1
+    print("Checkpoint variables:", len(ckpt_vars))
+    print("Graph variables:", len(tf.global_variables()))
+    print("Restoring matched variables:", len(restore_vars))
+    print("Skipping unmatched variables:", len(skipped_vars))
 
-    return costs / iters
+    if len(restore_vars) == 0:
+        raise RuntimeError("No matching variables found in checkpoint.")
+
+    return tf.train.Saver(var_list=restore_vars)
 
 
 def main(_):
-    ''' Loads trained model and evaluates it on test split '''
-
     if FLAGS.load_model is None:
-        print('Please specify checkpoint file to load model from')
-        return -1
+        print("Please specify checkpoint, e.g.")
+        print("python3 evaluate.py --load_model cv/autoencoder_epoch006_0.0000.model --data_dir dga_data")
+        return
 
-    if not os.path.exists(FLAGS.load_model + ".index"):
-        print('Checkpoint file not found', FLAGS.load_model)
-        return -1
+    if not os.path.exists(FLAGS.load_model + ".meta"):
+        print("Checkpoint file not found:", FLAGS.load_model)
+        return
 
-    word_vocab, char_vocab, word_tensors, char_tensors, max_word_length = \
-        load_data(FLAGS.data_dir, FLAGS.max_word_length, eos=FLAGS.EOS)
+    char_vocab, char_tensors, char_lens, max_word_length = load_data(
+        FLAGS.data_dir,
+        FLAGS.max_word_length
+    )
 
-    test_reader = DataReader(word_tensors['test'], char_tensors['test'],
-                              FLAGS.batch_size, FLAGS.num_unroll_steps)
+    if 'test' in char_tensors:
+        eval_split = 'test'
+    elif 'valid' in char_tensors:
+        eval_split = 'valid'
+    else:
+        eval_split = 'train'
 
-    print('initialized test dataset reader')
+    eval_reader = DataReader(
+        char_tensors[eval_split],
+        char_lens[eval_split],
+        FLAGS.batch_size
+    )
+
+    print("Using split:", eval_split)
+    print("Char vocab size:", char_vocab.size)
+    print("Max word length:", max_word_length)
 
     with tf.Graph().as_default(), tf.Session() as session:
-
-        # tensorflow seed must be inside graph
         tf.set_random_seed(FLAGS.seed)
         np.random.seed(seed=FLAGS.seed)
 
-        ''' build inference graph '''
         with tf.variable_scope("Model"):
-            m = model.inference_graph(
+            m = dga_model.inference_graph(
+                char_vocab_size=char_vocab.size,
+                char_embed_size=FLAGS.char_embed_size,
+                batch_size=FLAGS.batch_size,
+                num_highway_layers=FLAGS.highway_layers,
+                num_rnn_layers=FLAGS.rnn_layers,
+                rnn_size=FLAGS.rnn_size,
+                max_word_length=max_word_length,
+                kernels=eval(FLAGS.kernels),
+                kernel_features=eval(FLAGS.kernel_features),
+                dropout=FLAGS.dropout,
+                embed_dimension=FLAGS.embed_dimension
+            )
+
+            m.update(
+                dga_model.decoder_graph(
+                    m.embed_output,
                     char_vocab_size=char_vocab.size,
-                    word_vocab_size=word_vocab.size,
-                    char_embed_size=FLAGS.char_embed_size,
                     batch_size=FLAGS.batch_size,
                     num_highway_layers=FLAGS.highway_layers,
                     num_rnn_layers=FLAGS.rnn_layers,
@@ -97,39 +118,66 @@ def main(_):
                     max_word_length=max_word_length,
                     kernels=eval(FLAGS.kernels),
                     kernel_features=eval(FLAGS.kernel_features),
-                    num_unroll_steps=FLAGS.num_unroll_steps,
-                    dropout=0)
-            m.update(model.loss_graph(m.logits, FLAGS.batch_size, FLAGS.num_unroll_steps))
+                    dropout=FLAGS.dropout
+                )
+            )
 
-            global_step = tf.Variable(0, dtype=tf.int32, name='global_step')
+            m.update(
+                dga_model.en_decoder_loss_graph(
+                    m.input,
+                    m.input_len_g,
+                    m.decoder_output,
+                    batch_size=FLAGS.batch_size,
+                    max_word_length=max_word_length
+                )
+            )
 
-        saver = tf.train.Saver()
+        session.run(tf.global_variables_initializer())
+
+        saver = build_partial_saver(FLAGS.load_model)
         saver.restore(session, FLAGS.load_model)
-        print('Loaded model from', FLAGS.load_model, 'saved at global step', global_step.eval())
 
-        ''' training starts here '''
-        rnn_state = session.run(m.initial_rnn_state)
+        print("Loaded matched variables from:", FLAGS.load_model)
+        print("Start evaluation...")
+
+        total_loss = 0.0
+        total_loss1 = 0.0
+        total_loss2 = 0.0
         count = 0
-        avg_loss = 0
+
         start_time = time.time()
-        for x, y in test_reader.iter():
+
+        for x, y in eval_reader.iter():
+            loss, loss1, loss2 = session.run(
+                [m.en_decoder_loss, m.loss1, m.loss2],
+                {
+                    m.input: x,
+                    m.input_len_g: y
+                }
+            )
+
+            total_loss += loss
+            total_loss1 += loss1
+            total_loss2 += loss2
             count += 1
-            loss, rnn_state = session.run([
-                m.loss,
-                m.final_rnn_state
-            ], {
-                m.input  : x,
-                m.targets: y,
-                m.initial_rnn_state: rnn_state
-            })
 
-            avg_loss += loss
+        elapsed = time.time() - start_time
 
-        avg_loss /= count
-        time_elapsed = time.time() - start_time
+        if count == 0:
+            print("No evaluation batches found.")
+            return
 
-        print("test loss = %6.8f, perplexity = %6.8f" % (avg_loss, np.exp(avg_loss)))
-        print("test samples:", count*FLAGS.batch_size, "time elapsed:", time_elapsed, "time per one batch:", time_elapsed/count)
+        avg_loss = total_loss / count
+        avg_loss1 = total_loss1 / count
+        avg_loss2 = total_loss2 / count
+
+        print("Evaluation batches:", count)
+        print("Average loss:", avg_loss)
+        print("Average loss1:", avg_loss1)
+        print("Average loss2:", avg_loss2)
+        print("Perplexity:", np.exp(avg_loss))
+        print("Elapsed time:", elapsed)
+        print("Time per batch:", elapsed / count)
 
 
 if __name__ == "__main__":

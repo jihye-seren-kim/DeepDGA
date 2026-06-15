@@ -3,114 +3,144 @@ from __future__ import division
 from __future__ import print_function
 
 import os
-import time
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 
-import model
-from data_reader import load_data, DataReader
-
+import dga_model
+from dga_reader import load_data
 
 flags = tf.flags
 
-# data
-flags.DEFINE_string('load_model',   None,    'filename of the model to load')
-# we need data only to compute vocabulary
-flags.DEFINE_string('data_dir',   'data',    'data directory')
-flags.DEFINE_integer('num_samples', 300, 'how many words to generate')
-flags.DEFINE_float('temperature', 1.0, 'sampling temperature')
+flags.DEFINE_string('load_model', None, 'checkpoint path without .meta')
+flags.DEFINE_string('data_dir', 'dga_data', 'data directory')
+flags.DEFINE_integer('num_samples', 300, 'how many domains to generate')
+flags.DEFINE_integer('batch_size', 64, 'must match training batch size')
+flags.DEFINE_integer('random_dimension', 32, 'generator random input dimension')
 
-# model params
-flags.DEFINE_integer('rnn_size',        650,                            'size of LSTM internal state')
-flags.DEFINE_integer('highway_layers',  2,                              'number of highway layers')
-flags.DEFINE_integer('char_embed_size', 15,                             'dimensionality of character embeddings')
-flags.DEFINE_string ('kernels',         '[1,2,3,4,5,6,7]',              'CNN kernel widths')
-flags.DEFINE_string ('kernel_features', '[50,100,150,200,200,200,200]', 'number of features in the CNN kernel')
-flags.DEFINE_integer('rnn_layers',      2,                              'number of layers in the LSTM')
-flags.DEFINE_float  ('dropout',         0.5,                            'dropout. 0 = no dropout')
-
-# optimization
-flags.DEFINE_integer('max_word_length',     65,   'maximum word length')
-
-# bookkeeping
-flags.DEFINE_integer('seed',           3435, 'random number generator seed')
-flags.DEFINE_string ('EOS',            '+',  '<EOS> symbol. should be a single unused character (like +) for PTB and blank for others')
+flags.DEFINE_integer('rnn_size', 50, 'size of LSTM internal state')
+flags.DEFINE_integer('highway_layers', 2, 'number of highway layers')
+flags.DEFINE_integer('char_embed_size', 30, 'character embedding size')
+flags.DEFINE_integer('embed_dimension', 32, 'embedding dimension')
+flags.DEFINE_string('kernels', str([2] * 20 + [3] * 10), 'CNN kernel widths')
+flags.DEFINE_string('kernel_features', str([32] * 30), 'CNN kernel features')
+flags.DEFINE_integer('rnn_layers', 2, 'number of LSTM layers')
+flags.DEFINE_float('dropout', 0.0, 'dropout during generation')
+flags.DEFINE_integer('max_word_length', 70, 'maximum word length')
+flags.DEFINE_integer('seed', 1021, 'random seed')
 
 FLAGS = flags.FLAGS
 
 
+def clean_domain(s):
+    s = s.replace(" ", "")
+    s = s.replace("\x00", "")
+    return s.strip()
+
+
+def build_partial_saver(checkpoint_path):
+    reader = tf.train.NewCheckpointReader(checkpoint_path)
+    ckpt_vars = reader.get_variable_to_shape_map()
+
+    restore_vars = []
+    skipped_vars = []
+
+    for v in tf.global_variables():
+        name = v.name.split(":")[0]
+        if name in ckpt_vars:
+            restore_vars.append(v)
+        else:
+            skipped_vars.append(name)
+
+    print("Checkpoint variables:", len(ckpt_vars))
+    print("Graph variables:", len(tf.global_variables()))
+    print("Restoring matched variables:", len(restore_vars))
+    print("Skipping unmatched variables:", len(skipped_vars))
+
+    if len(restore_vars) == 0:
+        raise RuntimeError("No matching variables found in checkpoint.")
+
+    return tf.train.Saver(var_list=restore_vars)
+
+
 def main(_):
-    ''' Loads trained model and evaluates it on test split '''
-
     if FLAGS.load_model is None:
-        print('Please specify checkpoint file to load model from')
-        return -1
+        print("Please specify checkpoint, e.g.")
+        print("python3 generate.py --load_model cv/gl_epoch004_1.9666.model --data_dir dga_data")
+        return
 
-    if not os.path.exists(FLAGS.load_model + '.meta'):
-        print('Checkpoint file not found', FLAGS.load_model)
-        return -1
+    if not os.path.exists(FLAGS.load_model + ".meta"):
+        print("Checkpoint file not found:", FLAGS.load_model)
+        return
 
-    word_vocab, char_vocab, word_tensors, char_tensors, max_word_length = \
-        load_data(FLAGS.data_dir, FLAGS.max_word_length, eos=FLAGS.EOS)
+    char_vocab, char_tensors, char_lens, max_word_length = load_data(
+        FLAGS.data_dir,
+        FLAGS.max_word_length
+    )
 
-    print('initialized test dataset reader')
+    print("Loaded vocabulary. Char vocab size:", char_vocab.size)
+    print("Max word length:", max_word_length)
+
+    np_random = np.random.RandomState(FLAGS.seed)
 
     with tf.Graph().as_default(), tf.Session() as session:
-
-        # tensorflow seed must be inside graph
         tf.set_random_seed(FLAGS.seed)
-        np.random.seed(seed=FLAGS.seed)
 
-        ''' build inference graph '''
         with tf.variable_scope("Model"):
-            m = model.inference_graph(
-                    char_vocab_size=char_vocab.size,
-                    word_vocab_size=word_vocab.size,
-                    char_embed_size=FLAGS.char_embed_size,
-                    batch_size=1,
-                    num_highway_layers=FLAGS.highway_layers,
-                    num_rnn_layers=FLAGS.rnn_layers,
-                    rnn_size=FLAGS.rnn_size,
-                    max_word_length=max_word_length,
-                    kernels=eval(FLAGS.kernels),
-                    kernel_features=eval(FLAGS.kernel_features),
-                    num_unroll_steps=1,
-                    dropout=0)
+            gen_model = dga_model.genearator_layer(
+                batch_size=FLAGS.batch_size,
+                input_dimension=FLAGS.random_dimension,
+                max_word_length=max_word_length,
+                embed_dimension=FLAGS.embed_dimension
+            )
 
-            # we need global step only because we want to read it from the model
-            global_step = tf.Variable(0, dtype=tf.int32, name='global_step')
+            dec_model = dga_model.decoder_graph(
+                gen_model.gl_output,
+                char_vocab_size=char_vocab.size,
+                batch_size=FLAGS.batch_size,
+                num_highway_layers=FLAGS.highway_layers,
+                num_rnn_layers=FLAGS.rnn_layers,
+                rnn_size=FLAGS.rnn_size,
+                max_word_length=max_word_length,
+                kernels=eval(FLAGS.kernels),
+                kernel_features=eval(FLAGS.kernel_features),
+                dropout=FLAGS.dropout
+            )
 
-        saver = tf.train.Saver()
+            gen_model.update(dec_model)
+
+        session.run(tf.global_variables_initializer())
+
+        saver = build_partial_saver(FLAGS.load_model)
         saver.restore(session, FLAGS.load_model)
-        print('Loaded model from', FLAGS.load_model, 'saved at global step', global_step.eval())
 
-        ''' training starts here '''
-        rnn_state = session.run(m.initial_rnn_state)
-        logits = np.ones((word_vocab.size,))
-        rnn_state = session.run(m.initial_rnn_state)
-        for i in range(FLAGS.num_samples):
-            logits = logits / FLAGS.temperature
-            prob = np.exp(logits)
-            prob /= np.sum(prob)
-            prob = prob.ravel()
-            ix = np.random.choice(range(len(prob)), p=prob)
+        print("Loaded matched variables from", FLAGS.load_model)
+        print("Generated domains:")
 
-            word = word_vocab.token(ix)
-            if word == '|':  # EOS
-                print('<unk>', end=' ')
-            elif word == '+':
-                print('\n')
-            else:
-                print(word, end=' ')
+        generated_count = 0
 
-            char_input = np.zeros((1, 1, max_word_length))
-            for i,c in enumerate('{' + word + '}'):
-                char_input[0,0,i] = char_vocab[c]
+        while generated_count < FLAGS.num_samples:
+            generator_input = np_random.rand(
+                FLAGS.batch_size,
+                FLAGS.random_dimension
+            )
 
-            logits, rnn_state = session.run([m.logits, m.final_rnn_state],
-                                         {m.input: char_input,
-                                          m.initial_rnn_state: rnn_state})
-            logits = np.array(logits)
+            generated = session.run(
+                gen_model.generated_dga,
+                {
+                    gen_model.gl_input: generator_input
+                }
+            )
+
+            for row in generated:
+                domain = clean_domain(char_vocab.change(row))
+
+                if domain:
+                    print(domain)
+                    generated_count += 1
+
+                if generated_count >= FLAGS.num_samples:
+                    break
 
 
 if __name__ == "__main__":
